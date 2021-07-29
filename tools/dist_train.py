@@ -78,6 +78,8 @@ def parse_args():
 
 
 def main():
+
+    # 参数解析，将参数更新到配置中
     args = parse_args()
     update_config(cfg, args)
 
@@ -85,6 +87,7 @@ def main():
     cfg.RANK = args.rank
     cfg.freeze()
 
+    # 创建一个日志器
     logger, final_output_dir, tb_log_dir = create_logger(
         cfg, args.cfg, 'train'
     )
@@ -102,7 +105,7 @@ def main():
     args.distributed = args.world_size > 1 or cfg.MULTIPROCESSING_DISTRIBUTED
 
     ngpus_per_node = torch.cuda.device_count()
-    if cfg.MULTIPROCESSING_DISTRIBUTED:
+    if cfg.MULTIPROCESSING_DISTRIBUTED:  # 如果开启了分布式
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
@@ -113,7 +116,7 @@ def main():
             nprocs=ngpus_per_node,
             args=(ngpus_per_node, args, final_output_dir, tb_log_dir)
         )
-    else:
+    else:  # 没有分布式
         # Simply call main_worker function
         main_worker(
             ','.join([str(i) for i in cfg.GPUS]),
@@ -160,15 +163,20 @@ def main_worker(
             rank=args.rank
         )
 
+    # 更新自定义的一些参数
     update_config(cfg, args)
 
+    # 设置日志器
     # setup logger
     logger, _ = setup_logger(final_output_dir, args.rank, 'train')
 
+    #
+    # 构建网络 文件在lib/models/pose_higher_hrnet.py
     model = eval('models.'+cfg.MODEL.NAME+'.get_pose_net')(
         cfg, is_train=True
     )
-
+    #
+    # print("模型构建完成")
     # copy model file
     if not cfg.MULTIPROCESSING_DISTRIBUTED or (
             cfg.MULTIPROCESSING_DISTRIBUTED
@@ -193,15 +201,17 @@ def main_worker(
         dump_input = torch.rand(
             (1, 3, cfg.DATASET.INPUT_SIZE, cfg.DATASET.INPUT_SIZE)
         )
-        writer_dict['writer'].add_graph(model, (dump_input, ))
+        # writer_dict['writer'].add_graph(model, (dump_input, ))
         # logger.info(get_model_summary(model, dump_input, verbose=cfg.VERBOSE))
 
     if cfg.FP16.ENABLED:
         model = network_to_half(model)
 
+    # 开启了同步批标准化但是没有开启多线程
     if cfg.MODEL.SYNC_BN and not args.distributed:
         print('Warning: Sync BatchNorm is only supported in distributed training.')
 
+    # 是否开启了分布式
     if args.distributed:
         if cfg.MODEL.SYNC_BN:
             model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -224,20 +234,26 @@ def main_worker(
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
     elif args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
+        # torch.cuda.set_device(args.gpu)  # 该语句只能在ubuntu执行
+        # model = model.cuda(args.gpu)
+        model = torch.nn.DataParallel(model, device_ids=cfg.GPUS).cuda()  # windows
+
     else:
         model = torch.nn.DataParallel(model).cuda()
 
+    # 定义损失函数
     # define loss function (criterion) and optimizer
     loss_factory = MultiLossFactory(cfg).cuda()
 
+    # 数据加载
     # Data loading code
     train_loader = make_dataloader(
         cfg, is_train=True, distributed=args.distributed
     )
     logger.info(train_loader.dataset)
 
+    #
+    # 初始化参数和加载优化器
     best_perf = -1
     best_model = False
     last_epoch = -1
@@ -250,10 +266,11 @@ def main_worker(
             dynamic_loss_scale=cfg.FP16.DYNAMIC_LOSS_SCALE
         )
 
+    # 断点续存
     begin_epoch = cfg.TRAIN.BEGIN_EPOCH
-    checkpoint_file = os.path.join(
+    checkpoint_file = os.path.join(  # 断电继续训练
         final_output_dir, 'checkpoint.pth.tar')
-    if cfg.AUTO_RESUME and os.path.exists(checkpoint_file):
+    if cfg.AUTO_RESUME and os.path.exists(checkpoint_file):  # 参数重置关闭且存在断点文件则加载
         logger.info("=> loading checkpoint '{}'".format(checkpoint_file))
         checkpoint = torch.load(checkpoint_file)
         begin_epoch = checkpoint['epoch']
@@ -276,6 +293,8 @@ def main_worker(
             last_epoch=last_epoch
         )
 
+    ##
+    # 开始训练
     for epoch in range(begin_epoch, cfg.TRAIN.END_EPOCH):
         # train one epoch
         do_train(cfg, model, train_loader, loss_factory, optimizer, epoch,
@@ -284,14 +303,14 @@ def main_worker(
         # In PyTorch 1.1.0 and later, you should call `lr_scheduler.step()` after `optimizer.step()`.
         lr_scheduler.step()
 
-        perf_indicator = epoch
+        perf_indicator = epoch  # 当前的epoch是否大于最好的epoch，如果大于则设置为该epoch，且best_model=true
         if perf_indicator >= best_perf:
             best_perf = perf_indicator
             best_model = True
         else:
             best_model = False
 
-        if not cfg.MULTIPROCESSING_DISTRIBUTED or (
+        if not cfg.MULTIPROCESSING_DISTRIBUTED or (  # 没有开启多线程，或者开启多线程了该节点为0根节点，则开始记录
                 cfg.MULTIPROCESSING_DISTRIBUTED
                 and args.rank == 0
         ):

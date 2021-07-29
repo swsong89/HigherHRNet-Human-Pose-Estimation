@@ -30,8 +30,7 @@ _C.PIN_MEMORY = True
 _C.RANK = 0
 _C.VERBOSE = True
 _C.DIST_BACKEND = 'nccl'
-_C.MULTIPROCESSING_DISTRIBUTED = True
-
+_C.MULTIPROCESSING_DISTRIBUTED = False   # 是否开启多线程分布式
 # FP16 training params
 _C.FP16 = CN()
 _C.FP16.ENABLED = False
